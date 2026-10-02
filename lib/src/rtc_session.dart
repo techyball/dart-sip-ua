@@ -1202,7 +1202,19 @@ class RTCSession extends EventManager implements Owner {
       }
     });
 
-    handlers.on(EventCallFailed(), (EventCallFailed event) {
+    handlers.on(EventCallFailed(), (EventCallFailed event) async {
+      // Gamatel: RFC 3261 14.1, a failed re-INVITE leaves the session as it
+      // was. Roll the pending local offer back and keep the call; only if
+      // that is impossible, end it as before.
+      _isAttemptingIceRestart = false;
+      try {
+        await _connection!
+            .setLocalDescription(RTCSessionDescription('', 'rollback'));
+        logger.w('renegotiation failed; local offer rolled back, call kept');
+        return;
+      } catch (error) {
+        logger.e('renegotiation rollback failed: $error');
+      }
       terminate(<String, dynamic>{
         'cause': DartSIP_C.CausesType.WEBRTC_ERROR,
         'status_code': 500,
@@ -1643,13 +1655,37 @@ class RTCSession extends EventManager implements Owner {
   }
 
   void _iceRestart() async {
-    Map<String, dynamic> offerConstraints = _rtcOfferConstraints ??
-        <String, dynamic>{
-          'mandatory': <String, dynamic>{},
-          'optional': <dynamic>[],
-        };
-    offerConstraints['mandatory']['IceRestart'] = true;
-    renegotiate(options: offerConstraints);
+    // Gamatel: renegotiate() reads options['rtcOfferConstraints']; passing the
+    // constraints as the options map dropped IceRestart. Audio only, so the
+    // re-offer is not "upgraded" to video.
+    Map<String, dynamic> offerConstraints = <String, dynamic>{
+      'mandatory': <String, dynamic>{
+        'IceRestart': true,
+        'OfferToReceiveAudio': true,
+        'OfferToReceiveVideo': false,
+      },
+      'optional': <dynamic>[],
+    };
+    bool ok = renegotiate(options: <String, dynamic>{
+      'rtcOfferConstraints': offerConstraints,
+      'mediaConstraints': <String, dynamic>{'audio': true, 'video': false},
+    });
+    if (!ok) {
+      logger.w('ICE restart: renegotiate() not possible now');
+      _isAttemptingIceRestart = false;
+    }
+  }
+
+  /// Gamatel: ICE restart triggered by the app after a network change.
+  bool restartIce() {
+    if (_state != RtcSessionState.confirmed || _isAttemptingIceRestart) {
+      return false;
+    }
+    _iceDisconnectTimer?.cancel();
+    _iceDisconnectTimer = null;
+    _isAttemptingIceRestart = true;
+    _iceRestart();
+    return true;
   }
 
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
@@ -1677,13 +1713,14 @@ class RTCSession extends EventManager implements Owner {
         logger.w('ICE Connection State Disconnected.');
         if (_iceDisconnectTimer == null && !_isAttemptingIceRestart) {
           logger.i('Starting ICE disconnect timer...');
-          _iceDisconnectTimer = Timer(const Duration(seconds: 20), () {
+          _iceDisconnectTimer = Timer(const Duration(seconds: 3), () {
             logger.w('ICE disconnect timer fired!');
             if (_connection?.iceConnectionState ==
                     RTCIceConnectionState.RTCIceConnectionStateDisconnected &&
                 _state != RtcSessionState.terminated &&
                 _state != RtcSessionState.canceled &&
-                !_isAttemptingIceRestart) {
+                !_isAttemptingIceRestart &&
+                _ua.isConnected()) {
               logger.i('Attempting ICE restart after timeout...');
               _isAttemptingIceRestart = true;
               _iceRestart();
@@ -1762,7 +1799,16 @@ class RTCSession extends EventManager implements Owner {
   Future<RTCSessionDescription> _createLocalDescription(
       SdpType type, Map<String, dynamic>? constraints) async {
     logger.d('createLocalDescription()');
-    _iceGatheringState ??= RTCIceGatheringState.RTCIceGatheringStateNew;
+    final bool iceRestart = constraints?['iceRestart'] == true ||
+        (constraints?['mandatory'] is Map &&
+            constraints!['mandatory']['IceRestart'] == true);
+    if (iceRestart) {
+      // Gamatel: the cached state is still "complete" from the first offer,
+      // so the shortcut below would send the SDP before the new candidates.
+      _iceGatheringState = RTCIceGatheringState.RTCIceGatheringStateNew;
+    } else {
+      _iceGatheringState ??= RTCIceGatheringState.RTCIceGatheringStateNew;
+    }
     Completer<RTCSessionDescription> completer =
         Completer<RTCSessionDescription>();
 
@@ -2736,7 +2782,7 @@ class RTCSession extends EventManager implements Owner {
       sendRequest(SipMethod.ACK);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
 
@@ -3011,7 +3057,7 @@ class RTCSession extends EventManager implements Owner {
       _handleSessionTimersInIncomingResponse(response);
 
       // If it is a 2XX retransmission exit now.
-      if (succeeded != null) {
+      if (succeeded) {
         return;
       }
 
