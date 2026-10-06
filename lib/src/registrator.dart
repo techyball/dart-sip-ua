@@ -236,10 +236,11 @@ class Registrator {
                 contact.getParam('pub-gruu').replaceAll('"', '');
           }
 
-          if (!_registered) {
-            _registered = true;
-            _ua.registered(response: event.response);
-          }
+          // Gamatel: emit on every successful REGISTER, renewals included,
+          // so the app can tell an answered refresh from one that never got
+          // a response (half-open socket; Dart timers stall in CPU sleep).
+          _registered = true;
+          _ua.registered(response: event.response);
         } else
         // Interval too brief RFC3261 10.2.8.
         if (status_code.contains(RegExp(r'^423$'))) {
